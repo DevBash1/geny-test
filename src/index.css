@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+body {
+    margin: 0;
+    padding: 0;
+    background-color: var(--color-gray-900, #111827);
+    color: white;
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    overflow: hidden;
+}
+
+/* Hide Genymotion toolbar and control components to only render the device frame */
+.gm-floating-toolbar-wrapper,
+.gm-toolbar-wrapper,
+.gm-toolbar {
+    display: none !important;
+}
