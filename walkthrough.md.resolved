@@ -1,0 +1,246 @@
+# Genymotion SDK — Walkthrough
+
+## What Was Built
+
+A modular SDK in `/lib` with two sub-packages — **no existing code was modified**.
+
+### File Structure
+
+```
+lib/
+├── tsconfig.json
+├── backend/
+│   ├── index.ts              ← Barrel exports + GenymotionSDK factory
+│   ├── types.ts              ← All shared types
+│   ├── core/
+│   │   ├── EmulatorProvider.ts   ← Provider interface (swap point)
+│   │   └── InstanceManager.ts    ← Orchestration layer (DI)
+│   ├── providers/
+│   │   └── GenymotionProvider.ts  ← Genymotion SaaS REST implementation
+│   ├── auth/
+│   │   └── AuthManager.ts        ← JWT + API-token with auto-refresh
+│   ├── transport/
+│   │   └── HttpClient.ts         ← IHttpClient interface + Axios adapter
+│   └── utils/
+│       ├── RetryPolicy.ts        ← Exponential backoff with jitter
+│       └── Logger.ts             ← Console + Silent loggers
+└── react-sdk/
+    ├── index.ts              ← Barrel exports
+    ├── types.ts              ← GenyDeviceProps, GenyDeviceRef, ConnectionState
+    ├── genymotion.d.ts       ← Type declaration for device-web-player
+    ├── GenyDevice.tsx        ← Stream-only component (forwardRef)
+    ├── useGenyConnection.ts  ← WebRTC lifecycle hook (SSR-safe)
+    └── useDeviceStream.ts    ← Credential resolution hook
+```
+
+---
+
+## Architecture
+
+```mermaid
+graph TD
+    subgraph "Backend SDK"
+        IM["InstanceManager"] --> EP["EmulatorProvider interface"]
+        EP --> GP["GenymotionProvider"]
+        EP --> CP["CustomProvider (yours)"]
+        GP --> AM["AuthManager"]
+        GP --> HC["HttpClient (Axios)"]
+        GP --> RP["RetryPolicy"]
+    end
+
+    subgraph "React SDK"
+        GD["GenyDevice"] --> UGC["useGenyConnection"]
+        GD --> UDS["useDeviceStream"]
+        UGC --> DWP["@genymotion/device-web-player"]
+    end
+
+    GD -.-> |"getStreamUrl()"| IM
+```
+
+---
+
+## Usage Examples
+
+### 1. Backend — Quick Start (API Token)
+
+```ts
+import { GenymotionSDK } from './lib/backend';
+
+const sdk = new GenymotionSDK({
+  auth: { type: 'api-token', apiToken: process.env.GENYMOTION_API_KEY! },
+  logLevel: 'debug',
+});
+
+// Create + wait for ONLINE + get stream credentials
+const { instance, stream } = await sdk.instanceManager.createAndWait({
+  recipeUuid: 'your-recipe-uuid',
+  name: 'test-device-1',
+});
+
+console.log(stream.webrtcUrl, stream.token);
+
+// Later: stop
+await sdk.instanceManager.stopInstance(instance.uuid);
+```
+
+### 2. Backend — JWT Authentication
+
+```ts
+import { GenymotionSDK } from './lib/backend';
+
+const sdk = new GenymotionSDK({
+  auth: { type: 'jwt', email: 'you@example.com', password: 'secret' },
+});
+// JWT auto-refreshes before expiry — no manual token management needed
+```
+
+### 3. Backend — Individual Module Imports
+
+```ts
+import { AuthManager } from './lib/backend/auth/AuthManager';
+import { AxiosHttpClient } from './lib/backend/transport/HttpClient';
+import { GenymotionProvider } from './lib/backend/providers/GenymotionProvider';
+import { InstanceManager } from './lib/backend/core/InstanceManager';
+import { ConsoleLogger } from './lib/backend/utils/Logger';
+
+const logger = new ConsoleLogger('debug');
+const httpClient = new AxiosHttpClient({ logger });
+const authManager = new AuthManager({
+  credentials: { type: 'api-token', apiToken: 'your-token' },
+  httpClient,
+  logger,
+});
+
+const provider = new GenymotionProvider({ httpClient, authManager, logger });
+const manager = new InstanceManager(provider, logger);
+```
+
+### 4. React — GenyDevice Component
+
+```tsx
+import { GenyDevice } from './lib/react-sdk';
+
+// Auto-connect via instanceId
+<GenyDevice
+  instanceId="abc-123"
+  apiKey="your-api-token"
+  autoConnect
+  style={{ width: 400, height: 800 }}
+/>
+
+// Direct stream URL
+<GenyDevice streamUrl="wss://..." token="access-token" autoConnect />
+```
+
+### 5. React — Imperative Control via Ref
+
+```tsx
+import { useRef } from 'react';
+import { GenyDevice, type GenyDeviceRef } from './lib/react-sdk';
+
+function Player() {
+  const ref = useRef<GenyDeviceRef>(null);
+
+  return (
+    <>
+      <GenyDevice ref={ref} instanceId="abc-123" apiKey="token" />
+      <button onClick={() => ref.current?.connect()}>Connect</button>
+      <button onClick={() => ref.current?.disconnect()}>Disconnect</button>
+      <button onClick={() => ref.current?.reload()}>Reload</button>
+      <button onClick={() => console.log(ref.current?.getStatus())}>Status</button>
+    </>
+  );
+}
+```
+
+### 6. Replace Genymotion with Another Provider
+
+```ts
+import type { EmulatorProvider } from './lib/backend/core/EmulatorProvider';
+import { InstanceManager } from './lib/backend/core/InstanceManager';
+
+class AWSDeviceFarmProvider implements EmulatorProvider {
+  async createInstance(config) { /* AWS Device Farm API */ }
+  async startInstance(id) { /* ... */ }
+  async stopInstance(id) { /* ... */ }
+  async deleteInstance(id) { /* ... */ }
+  async getInstanceStatus(id) { /* ... */ }
+  async waitUntilReady(id, timeout?) { /* ... */ }
+  async createSnapshot(id, config) { /* ... */ }
+  async restoreSnapshot(recipeId, name) { /* ... */ }
+  async connectAdb(id) { /* ... */ }
+  async getStreamUrl(id) { /* ... */ }
+  async listRecipes() { /* ... */ }
+  async listInstances() { /* ... */ }
+}
+
+// Inject your provider — frontend code doesn't change at all
+const manager = new InstanceManager(new AWSDeviceFarmProvider());
+```
+
+### 7. CI — GitHub Actions
+
+```yaml
+name: Android E2E Tests
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci
+
+      - name: Start Genymotion Instance
+        env:
+          GENY_API_TOKEN: ${{ secrets.GENYMOTION_API_KEY }}
+        run: |
+          node -e "
+            const { GenymotionSDK } = require('./lib/backend');
+            const sdk = new GenymotionSDK({
+              auth: { type: 'api-token', apiToken: process.env.GENY_API_TOKEN }
+            });
+            sdk.instanceManager.createAndWait({
+              recipeUuid: '${{ vars.RECIPE_UUID }}',
+              name: 'ci-\${{ github.run_id }}'
+            }).then(({ instance }) => {
+              console.log('INSTANCE_ID=' + instance.uuid);
+            });
+          "
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Cleanup
+        if: always()
+        run: |
+          node -e "
+            const { GenymotionSDK } = require('./lib/backend');
+            const sdk = new GenymotionSDK({
+              auth: { type: 'api-token', apiToken: process.env.GENY_API_TOKEN }
+            });
+            sdk.instanceManager.stopInstance(process.env.INSTANCE_ID);
+          "
+```
+
+---
+
+## Error Handling Strategy
+
+| Layer | Strategy |
+|---|---|
+| `RetryPolicy` | Auto-retries 5xx, 429, network errors with exponential backoff + jitter |
+| `AuthManager` | Auto-refreshes JWT 1h before 48h expiry |
+| `GenymotionProvider` | All API calls wrapped in retry; `waitUntilReady()` throws on terminal states |
+| `GenyDevice` | `onError` callback; `data-geny-status` attribute for CSS-based state indication |
+
+---
+
+## Verification Results
+
+| Check | Result |
+|---|---|
+| `tsc --noEmit -p lib/tsconfig.json` | ✅ Zero errors |
+| `tsc --noEmit -p tsconfig.app.json` | ✅ Zero errors (existing project unaffected) |
+| No existing file modified | ✅ Confirmed |
